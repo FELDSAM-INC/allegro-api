@@ -11,85 +11,129 @@ use RuntimeException;
 
 /**
  * Object PHP interface for Allegro REST API
- * 
- * This class allows you to call any resource 
+ *
+ * This class allows you to call any resource
  * with correct request
- * 
+ *
  * It also implements some features which
  * will save you a lot of time
- * 
+ *
  * Example:
  * <pre>
  * // Register your application here:
  * // https://apps.developer.allegro.pl
- * 
+ *
  * // Creating auth URL using client id and redirect_uri
  * var_dump(
  *     AllegroRestApi::getAuthLink($clientId, $redirectUri)
  * );
- * 
- * // After clicking the link and granting permission you 
+ *
+ * // After clicking the link and granting permission you
  * // will be redirected to $redirectUri with "code"
  * //
  * // Use given code to finally generate access token
  * $tokens = AllegroRestApi::generateToken(
- *     $_GET['code'], 
- *     $clientId, 
- *     $clientSecret, 
+ *     $_GET['code'],
+ *     $clientId,
+ *     $clientSecret,
  *     $redirectUri
  * );
- * 
+ *
  * // Above token will be active for 12 hours and you can
  * // refresh it indefinitely (in example using cron)
  * AllegroRestApi::refreshToken(
- *     $tokens->refresh_token, 
- *     $clientId, 
- *     $clientSecret, 
+ *     $tokens->refresh_token,
+ *     $clientId,
+ *     $clientSecret,
  *     $redirectUri
  * );
- * 
+ *
  * // Creating an instance of RestApi
  * $restApi = new AllegroRestApi($tokens->access_token);
- * 
+ *
  * // Getting our comments
  * $response = $restApi->get('/sale/user-ratings?user.id=' . $yourUserId)
+ *
+ * // example auth using device code
+ * // load tokes from file
+ * if(file_exists('.allegro.json') && $tokens = file_get_contents('.allegro.json'))
+ * {
+ *     $tokens = json_decode($tokens);
+ *     if(
+ *         !is_array($tokens) ||
+ *         !isset($tokens['access_token']) ||
+ *         !isset($tokens['refresh_token']) ||
+ *         !isset($tokens['expires_in']) ||
+ *         time() >= $tokens['expires_in']
+ *     ) {
+ *         $tokens = null;
+ *     }
+ * }
+ *
+ * if($tokens === null) {
+ *     $response = AllegroRestApi::getDeviceAuthLink($clientId, $clientSecret);
+ *     list($deviceCode, $verificationLink) = $response;
+ *
+ *     echo 'Please enter following url to the browser and authorize this device.'."\n\n";
+ *     echo $verificationLink."\n\n";
+ *
+ *     do {
+ *         echo 'Waiting for validation...'."\n";
+ *         try {
+ *             $r = AllegroRestApi::generateToken($deviceCode, $clientId, $clientSecret);
+ *             $tokens = [
+ *                 'access_token' => $r->access_token,
+ *                 'refresh_token' => $r->refresh_token,
+ *                 'expires_in' => time() + $r->expires_in,
+ *             ];
+ *         } catch (\RuntimeException $e) {
+ *             sleep(5);
+ *         }
+ *     } while ($tokens === null);
+ *
+ *     // store tokens
+ *     echo 'Validated, saving tokens to .allegro.json file'."\n\n";
+ *     file_put_contents('.allegro.json', json_encode($tokens));
+ * }
+ *
  * </pre>
- * 
+ *
  * @see        https://developer.allegro.pl/about/
  * @author     ASOCIAL MEDIA Maciej Strączkowski <biuro@asocial.media>
  * @copyright  ASOCIAL MEDIA Maciej Strączkowski
  * @version    3.1.0
  */
+
 class AllegroRestApi
 {
     /**
      * An url address for production API
      */
     const URL = 'https://api.allegro.pl';
-    
+
     /**
      * An url address for sandbox API
      */
     const SANDBOX_URL = 'https://api.allegro.pl.allegrosandbox.pl';
-        
+
     /**
      * Allegro REST API access token
-     * 
+     *
      * @var string
      */
     protected $token = null;
-    
+
     /**
      * Should we use sandbox mode?
-     * 
+     *
      * @var boolean
      */
     protected $sandbox = false;
-        
+
     /**
      * Saves given token and sandbox boolean
      * value into class properties
-     * 
+     *
      * @param   string   $token
      * @param   boolean  $sandbox
      */
@@ -98,11 +142,11 @@ class AllegroRestApi
         $this->setToken($token);
         $this->setSandbox($sandbox);
     }
-    
+
     /**
-     * Returns an authorization link which user 
+     * Returns an authorization link which user
      * should click to give access
-     * 
+     *
      * @param   string  $clientId
      * @param   string  $redirectUri
      * @return  string
@@ -114,37 +158,92 @@ class AllegroRestApi
             . "&client_id=$clientId"
             . "&redirect_uri=$redirectUri";
     }
-    
+
     /**
-     * Generates access token using given 
+     * Returns an authorization link which user
+     * should open in browser to give access
+     *
+     * @param   string  $clientId
+     * @param   string  $clientSecret
+     * @return  array   [device_code, verification_link]
+     */
+    public static function getDeviceAuthLink($clientId, $clientSecret)
+    {
+        // Creating an instance of class
+        $api = new AllegroRestApi(null, null);
+
+        // Returning response
+        $response = $api->sendRequest("https://allegro.pl/auth/oauth/device"
+            . "?client_id=$clientId",
+            'POST',
+            array(),
+            array(
+                'Accept' => null,
+                'Authorization' => 'Basic ' . base64_encode("$clientId:$clientSecret"),
+                'Content-Type' => 'application/x-www-form-urlencoded'
+            )
+        );
+
+        return [$response->device_code, $response->verification_uri_complete];
+    }
+
+    /**
+     * Generates access token using given
      * credentials and code
-     * 
+     *
      * @param   string  $code         Code from allegro
      * @param   string  $clientId     Client ID
      * @param   string  $clientSecret Client secret
      * @param   string  $redirectUri  Redirect URI
      * @return  object
      */
-    public static function generateToken($code, $clientId, $clientSecret, $redirectUri)
+    public static function generateToken($code, $clientId, $clientSecret, $redirectUri = null)
     {
         // Creating an instance of class
         $api = new AllegroRestApi(null, null);
-        
+
+        // no code and no redirect uri, so issue tokens for read only public actions
+        if($code === null && $redirectUri === null) {
+            // Returning response
+            return $api->sendRequest("https://allegro.pl/auth/oauth/token"
+                ."?grant_type=client_credentials",
+                'POST',
+                array(),
+                array(
+                    'Authorization' => 'Basic '.base64_encode("$clientId:$clientSecret")
+                )
+            );
+        }
+
+        if($redirectUri !== null) {
+            // Returning response
+            return $api->sendRequest("https://allegro.pl/auth/oauth/token"
+                ."?grant_type=authorization_code"
+                ."&code=$code"
+                ."&redirect_uri=$redirectUri",
+                'POST',
+                array(),
+                array(
+                    'Authorization' => 'Basic '.base64_encode("$clientId:$clientSecret")
+                )
+            );
+        }
+
+        // get token using device code
         // Returning response
         return $api->sendRequest("https://allegro.pl/auth/oauth/token"
-            . "?grant_type=authorization_code"
-            . "&code=$code"
-            . "&redirect_uri=$redirectUri",
-            'POST', 
-            array(), 
+            ."?grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+            ."&device_code=$code",
+            'POST',
+            array(),
             array(
-                'Authorization' => 'Basic ' . base64_encode("$clientId:$clientSecret")
+                'Authorization' => 'Basic '.base64_encode("$clientId:$clientSecret")
             )
         );
     }
-    
+
     /**
-     * Refreshes access token using given 
+     * Refreshes access token using given
      * credentials
      *
      * @param   string  $refreshToken Refresh token
@@ -157,14 +256,14 @@ class AllegroRestApi
     {
         // Creating an instance of class
         $api = new AllegroRestApi(null, null);
-        
+
         // Returning response
         return $api->sendRequest("https://allegro.pl/auth/oauth/token"
             . "?grant_type=refresh_token"
             . "&refresh_token=$refreshToken"
             . "&redirect_uri=$redirectUri",
-            'POST', 
-            array(), 
+            'POST',
+            array(),
             array(
                 'Authorization' => 'Basic ' . base64_encode("$clientId:$clientSecret")
             )
@@ -174,70 +273,70 @@ class AllegroRestApi
     /**
      * Stores token in class property to
      * use it in requests
-     * 
+     *
      * @param   string  $value  Access token
      * @return  AllegroRestApi
      */
     public function setToken($value)
     {
         $this->token = $value;
-        
+
         return $this;
     }
 
     /**
      * Returns api access token from property
-     * 
+     *
      * @return  string  Access token
      */
     public function getToken()
     {
         return $this->token;
     }
-    
+
     /**
      * Stores boolean in class property to
      * determine which environment should we use
-     * 
+     *
      * @param   boolean  $value  True or false
      * @return  AllegroRestApi
      */
     public function setSandbox($value)
     {
         $this->sandbox = (boolean)$value;
-        
+
         return $this;
     }
 
     /**
      * Returns boolean value which determines
      * which environment should we use
-     * 
+     *
      * @return  boolean  True or false
      */
     public function getSandbox()
     {
         return $this->sandbox;
     }
-    
+
     /**
      * Returns REST API basic URL depending
      * on current sandbox setting
-     * 
+     *
      * @return  string  An URL address
      */
     public function getUrl()
     {
         // Returning correct URL depending on sandbox setting
-        return $this->getSandbox() 
-            ? AllegroRestApi::SANDBOX_URL 
+        return $this->getSandbox()
+            ? AllegroRestApi::SANDBOX_URL
             : AllegroRestApi::URL;
     }
-    
+
     /**
      * Generates UUID which can be used in
      * some actions
-     * 
+     *
      * @return  string  UUID
      */
     public function getUuid()
@@ -254,11 +353,11 @@ class AllegroRestApi
             mt_rand(0, 0xffff)
         );
     }
-    
+
     /**
      * Sends GET request to Allegro REST API
      * and returns response
-     * 
+     *
      * @param   string  $resource   Resource path
      * @param   array   $headers    Request headers
      * @return  object
@@ -271,7 +370,7 @@ class AllegroRestApi
     /**
      * Sends POST request to Allegro REST API
      * and returns response
-     * 
+     *
      * @param   string  $resource   Resource path
      * @param   array   $data       Request body
      * @param   array   $headers    Request headers
@@ -282,11 +381,11 @@ class AllegroRestApi
     {
         return $this->sendRequest($resource, 'POST', $data, $headers, $json);
     }
-    
+
     /**
      * Sends PUT request to Allegro REST API
      * and returns response
-     * 
+     *
      * @param   string  $resource   Resource path
      * @param   array   $data       Request body
      * @param   array   $headers    Request headers
@@ -297,11 +396,11 @@ class AllegroRestApi
     {
         return $this->sendRequest($resource, 'PUT', $data, $headers, $json);
     }
-    
+
     /**
      * Sends DELETE request to Allegro REST API
      * and returns response
-     * 
+     *
      * @param   string  $resource   Resource path
      * @param   array   $headers    Request headers
      * @return  object
@@ -310,13 +409,13 @@ class AllegroRestApi
     {
         return $this->sendRequest($resource, 'DELETE', array(), $headers);
     }
-    
+
     /**
      * Sends request to Allegro REST API
      * using given arguments
      *
      * Returns API response as JSON object
-     * 
+     *
      * @param   string  $resource   Resource path
      * @param   string  $method     Request method
      * @param   mixed   $data       Request body
@@ -345,14 +444,14 @@ class AllegroRestApi
 
         // Getting result from API
         $response = json_decode(file_get_contents(
-            (stristr($resource, 'http') !== false 
-                ? $resource 
+            (stristr($resource, 'http') !== false
+                ? $resource
                 : $this->getUrl() . '/' . ltrim($resource, '/')
-            ), 
-            false, 
+            ),
+            false,
             stream_context_create($options)
         ));
-        
+
         // We have found an error in response
         if (isset($response->errors) || isset($response->error_description)) {
 
@@ -362,18 +461,18 @@ class AllegroRestApi
                 $this->getResponseCode($http_response_header)
             );
         }
-        
+
         // Checking if our response is a valid object
         if (!is_object($response)) {
-            
+
             // Creating an instance of stdClass
             $response = new \stdClass();
         }
-        
+
         // Saving response and request headers
         $response->request_headers  = $requestHeaders;
         $response->response_headers = $http_response_header;
-        
+
         // Returning response
         return $response;
     }
@@ -425,14 +524,14 @@ class AllegroRestApi
     {
         // Creating variable for headers
         $stringHeaders = '';
-        
+
         // Loop over each of header
         foreach ($headers as $header => $value) {
-            
+
             // Adding header line
             $stringHeaders .= "$header: $value\r\n";
         }
-        
+
         // Returning headers
         return $stringHeaders;
     }
